@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import json
 import threading
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -32,31 +33,70 @@ HAND_CONNECTIONS = (
     (5, 9), (9, 13), (13, 17),
 )
 
+COMMON_WORDS = [
+    "HELLO", "WORLD", "HELP", "PLEASE", "THANK", "YOU",
+    "YES", "NO", "GOOD", "MORNING", "NIGHT", "FINE", "NAME",
+    "WHAT", "HOW", "WHERE", "WHEN", "WHY", "DEAF", "HEARING",
+    "FRIEND", "LOVE", "LEARN", "SIGN", "LANGUAGE"
+]
+
+
+@st.cache_data(ttl=1800)
+def fetch_metered_turn(api_key: str, app_name: str = "") -> list[dict[str, Any]]:
+    """Fetch ephemeral TURN credentials from Metered.ca API."""
+    domain = f"{app_name}.metered.live" if app_name else "global.metered.live"
+    url = f"https://{domain}/api/v1/turn/credentials?apiKey={api_key}"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Streamlit-ASL"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+            if isinstance(data, list):
+                return data
+    except Exception as exc:
+        print(f"Error fetching Metered TURN credentials: {exc}")
+    return []
+
+
+@st.cache_data(ttl=1800)
+def fetch_twilio_turn(account_sid: str, auth_token: str) -> list[dict[str, Any]]:
+    """Fetch ephemeral TURN credentials from Twilio Network Traversal API."""
+    try:
+        from twilio.rest import Client
+        client = Client(account_sid, auth_token)
+        token = client.tokens.create()
+        return token.ice_servers
+    except Exception as exc:
+        print(f"Error fetching Twilio TURN credentials: {exc}")
+    return []
+
 
 def get_ice_servers() -> list[dict[str, Any]]:
-    """Return STUN and TURN configuration with open relay fallback for cloud NAT traversal."""
+    """Return configured ICE servers (STUN + optional TURN for cloud environments)."""
     if "ice_servers" in st.secrets:
-        return st.secrets["ice_servers"]
+        return list(st.secrets["ice_servers"])
+
+    if "METERED_API_KEY" in st.secrets:
+        servers = fetch_metered_turn(
+            st.secrets["METERED_API_KEY"],
+            st.secrets.get("METERED_APP_NAME", ""),
+        )
+        if servers:
+            return servers
+
+    if "TWILIO_ACCOUNT_SID" in st.secrets and "TWILIO_AUTH_TOKEN" in st.secrets:
+        servers = fetch_twilio_turn(
+            st.secrets["TWILIO_ACCOUNT_SID"],
+            st.secrets["TWILIO_AUTH_TOKEN"],
+        )
+        if servers:
+            return servers
+
     return [
         {"urls": ["stun:stun.l.google.com:19302"]},
         {"urls": ["stun:stun1.l.google.com:19302"]},
         {"urls": ["stun:stun2.l.google.com:19302"]},
-        {"urls": ["stun:openrelay.metered.ca:80"]},
-        {
-            "urls": ["turn:openrelay.metered.ca:80"],
-            "username": "openrelayproject",
-            "credential": "openrelayproject",
-        },
-        {
-            "urls": ["turn:openrelay.metered.ca:443"],
-            "username": "openrelayproject",
-            "credential": "openrelayproject",
-        },
-        {
-            "urls": ["turn:openrelay.metered.ca:443?transport=tcp"],
-            "username": "openrelayproject",
-            "credential": "openrelayproject",
-        },
+        {"urls": ["stun:stun3.l.google.com:19302"]},
+        {"urls": ["stun:stun4.l.google.com:19302"]},
     ]
 
 
@@ -113,7 +153,6 @@ class RecognitionSession:
             image = frame.to_ndarray(format="bgr24")
             image = cv.flip(image, 1)
 
-            # Cap frame width to 640px to conserve bandwidth and CPU
             h, w = image.shape[:2]
             if w > 640:
                 scale = 640.0 / w
@@ -157,12 +196,11 @@ class RecognitionSession:
             self._draw_overlay(image, sentence)
             return av.VideoFrame.from_ndarray(image, format="bgr24")
         except Exception as exc:
-            # Prevent WebRTC crash on frame error
-            print(f"Frame processing error: {exc}")
+            print(f"Live frame error: {exc}")
             return frame
 
     def process_static_image(self, bgr_image: np.ndarray) -> tuple[np.ndarray, str | None, float]:
-        """Process a single image snapshot from browser camera or upload."""
+        """Process a single image snapshot from the browser camera."""
         image = bgr_image.copy()
         h, w = image.shape[:2]
         if w > 640:
@@ -217,6 +255,15 @@ class RecognitionSession:
             if self._sentence and not self._sentence.endswith(" "):
                 self._sentence += " "
 
+    def apply_word(self, word: str) -> None:
+        with self._lock:
+            words = self._sentence.rstrip().split(" ")
+            if words:
+                words[-1] = word
+            else:
+                words = [word]
+            self._sentence = " ".join(words) + " "
+
     def _draw_overlay(self, image: np.ndarray, sentence: str) -> None:
         height, width = image.shape[:2]
         cv.rectangle(image, (0, 0), (width, 88), (18, 27, 45), -1)
@@ -257,6 +304,7 @@ st.markdown(
       .block-container { max-width: 1280px; padding-top: 1.5rem; }
       [data-testid="stMetric"] { border-left: 3px solid #23a6d5; padding-left: 0.8rem; }
       [data-testid="stImage"] img { border: 1px solid #d7dde5; border-radius: 6px; }
+      .stButton button { border-radius: 6px; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -267,14 +315,43 @@ if "recognition_session" not in st.session_state:
 session: RecognitionSession = st.session_state.recognition_session
 
 st.title("🤟 ASL Sign to Text")
-st.caption("Real-time fingerspelling recognition")
+st.caption("Fingerspelling recognition powered by MediaPipe & Deep Learning")
 
 camera_column, reference_column = st.columns((2, 1), gap="large")
 
 with camera_column:
-    mode_tab_live, mode_tab_snapshot = st.tabs(["🎥 Live Stream", "📸 Snapshot Camera"])
+    tab_snapshot, tab_live = st.tabs(["📸 Snapshot Camera (Recommended)", "🎥 Live Video Stream (WebRTC)"])
 
-    with mode_tab_live:
+    with tab_snapshot:
+        st.write("Hold your hand sign in the camera frame and click **Take photo**:")
+        camera_snap = st.camera_input("Capture gesture", label_visibility="collapsed")
+        if camera_snap is not None:
+            raw_bytes = np.asarray(bytearray(camera_snap.read()), dtype=np.uint8)
+            snap_img = cv.imdecode(raw_bytes, cv.IMREAD_COLOR)
+            processed_img, recognized_char, conf = session.process_static_image(snap_img)
+
+            res_col1, res_col2 = st.columns(2)
+            with res_col1:
+                st.image(
+                    cv.cvtColor(processed_img, cv.COLOR_BGR2RGB),
+                    caption="Analyzed Hand Landmarks",
+                    use_column_width=True,
+                )
+            with res_col2:
+                if recognized_char:
+                    st.metric("Detected Sign", recognized_char)
+                    st.metric("Confidence", f"{conf:.0%}")
+                    if st.button(f"➕ Add '{recognized_char}' to Message", type="primary", use_container_width=True):
+                        session.add_character(recognized_char)
+                        st.rerun()
+                else:
+                    st.warning("⚠️ No hand detected. Hold your hand clearly in front of the camera with good lighting.")
+
+    with tab_live:
+        has_turn_secrets = any(
+            k in st.secrets for k in ("METERED_API_KEY", "TWILIO_ACCOUNT_SID", "ice_servers")
+        )
+
         webrtc_ctx = webrtc_streamer(
             key="asl-sign-camera",
             mode=WebRtcMode.SENDRECV,
@@ -290,63 +367,64 @@ with camera_column:
             rtc_configuration={"iceServers": get_ice_servers()},
             async_processing=True,
         )
-        if webrtc_ctx and webrtc_ctx.state.playing:
-            st.success("🟢 Camera stream connected & active")
-        else:
-            st.info("Click **START** above to begin live video. If your network blocks live WebRTC, switch to the **Snapshot Camera** tab!")
 
-    with mode_tab_snapshot:
-        st.write("Take a snapshot of your hand gesture:")
-        camera_snap = st.camera_input("Capture gesture", label_visibility="collapsed")
-        if camera_snap is not None:
-            raw_bytes = np.asarray(bytearray(camera_snap.read()), dtype=np.uint8)
-            snap_img = cv.imdecode(raw_bytes, cv.IMREAD_COLOR)
-            processed_img, recognized_char, conf = session.process_static_image(snap_img)
-            
-            snap_col1, snap_col2 = st.columns(2)
-            with snap_col1:
-                st.image(
-                    cv.cvtColor(processed_img, cv.COLOR_BGR2RGB),
-                    caption="Analyzed Hand",
-                    use_column_width=True,
+        if webrtc_ctx and webrtc_ctx.state.playing:
+            st.success("🟢 Live stream connected")
+        else:
+            if not has_turn_secrets:
+                st.info(
+                    "💡 **Note for Cloud Users:** If the video stream resets or stays on 'START', "
+                    "your network or cloud container blocks direct WebRTC UDP packets. "
+                    "Use the **Snapshot Camera** tab, or add a free TURN relay key to Secrets."
                 )
-            with snap_col2:
-                if recognized_char:
-                    st.metric("Detected Letter", recognized_char)
-                    st.metric("Confidence", f"{conf:.0%}")
-                    if st.button(f"Add '{recognized_char}' to Message", use_container_width=True):
-                        session.add_character(recognized_char)
-                        st.rerun()
-                else:
-                    st.warning("No hand detected. Please hold your hand clearly in front of the camera.")
+                with st.expander("🛠️ How to enable Live Video on Streamlit Cloud (2 minutes)"):
+                    st.markdown(
+                        """
+                        Streamlit Community Cloud containers block incoming peer-to-peer UDP connections. 
+                        WebRTC requires a TURN server to relay video over HTTPS ports.
+
+                        **To enable live continuous streaming for free:**
+                        1. Create a free account at [metered.ca/stun-turn](https://www.metered.ca/stun-turn) (50 GB free monthly, no card required).
+                        2. In your Streamlit app, click **`⋮`** (bottom right) ➔ **Settings** ➔ **Secrets**.
+                        3. Add:
+                        ```toml
+                        METERED_API_KEY = "your_api_key_from_metered"
+                        ```
+                        4. Save. Live video will now connect seamlessly through the TURN relay!
+                        """
+                    )
+
+    # Word suggestions
+    current_text = session.snapshot()["sentence"]
+    words = current_text.split(" ") if current_text else []
+    last_word = words[-1].upper() if words else ""
+    suggestions = [w for w in COMMON_WORDS if w.startswith(last_word)][:4] if last_word else ["HELLO", "YES", "NO", "THANK"]
+
+    st.write("**Suggestions:**")
+    sugg_cols = st.columns(len(suggestions))
+    for i, s_word in enumerate(suggestions):
+        if sugg_cols[i].button(s_word, key=f"sugg_{s_word}_{i}", use_container_width=True):
+            session.apply_word(s_word)
+            st.rerun()
+
+    # Readout & Message display
+    state = session.snapshot()
+    st.text_area("Formed Message", value=state["sentence"], height=90, disabled=True)
+
+    c_clear, c_delete, c_space, c_speak = st.columns(4)
+    if c_clear.button("🗑️ Clear", use_container_width=True):
+        session.clear()
+        st.rerun()
+    if c_delete.button("⌫ Delete", use_container_width=True):
+        session.delete_last()
+        st.rerun()
+    if c_space.button("␣ Space", use_container_width=True):
+        session.add_space()
+        st.rerun()
+    if c_speak.button("🔊 Speak", type="primary", use_container_width=True):
+        sentence_to_speak = session.snapshot()["sentence"].strip()
+        if sentence_to_speak:
+            speak_in_browser(sentence_to_speak)
 
 with reference_column:
     st.image(str(CHART_PATH), caption="ASL alphabet reference", use_column_width=True)
-
-
-@st.fragment(run_every=0.4)
-def live_readout() -> None:
-    state = session.snapshot()
-    letter_column, confidence_column = st.columns(2)
-    letter_column.metric("Detected letter", state["character"])
-    confidence_column.metric("Stable confidence", f"{state['confidence']:.0%}")
-    st.progress(state["progress"], text=state["hint"])
-    st.text_area("Message", value=state["sentence"], height=100, disabled=True)
-
-
-live_readout()
-
-clear_column, delete_column, space_column, speak_column = st.columns(4)
-if clear_column.button("Clear", use_container_width=True):
-    session.clear()
-    st.rerun()
-if delete_column.button("Delete", use_container_width=True):
-    session.delete_last()
-    st.rerun()
-if space_column.button("Space", use_container_width=True):
-    session.add_space()
-    st.rerun()
-if speak_column.button("Speak", use_container_width=True):
-    sentence = session.snapshot()["sentence"].strip()
-    if sentence:
-        speak_in_browser(sentence)
