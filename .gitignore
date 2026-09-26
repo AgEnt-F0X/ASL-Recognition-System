@@ -131,8 +131,6 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
-# bat
-*.bat
 .idea/
 
 .DS_Store

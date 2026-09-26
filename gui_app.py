@@ -8,9 +8,13 @@ import copy
 import itertools
 import pyttsx3
 import threading
+from pathlib import Path
+import sys, os
 from gesture_text import GestureTextComposer, TemporalPredictionFilter
 
 from model.keypoint_classifier.keypoint_classifier import KeyPointClassifier
+
+BASE_DIR = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
 
 # --- Helper Functions (Copied/Adapted from app.py to avoid import execution) ---
 def calc_bounding_rect(image, landmarks):
@@ -143,10 +147,10 @@ class ASLApp(ctk.CTk):
             min_detection_confidence=self.min_detection_confidence,
             min_tracking_confidence=self.min_tracking_confidence,
         )
-        self.keypoint_classifier = KeyPointClassifier()
+        self.keypoint_classifier = KeyPointClassifier(model_path=str(BASE_DIR / "model" / "keypoint_classifier" / "keypoint_classifier.tflite"))
         
         # Read labels
-        with open("model/keypoint_classifier/keypoint_classifier_label.csv", encoding="utf-8-sig") as f:
+        with open(BASE_DIR / "model" / "keypoint_classifier" / "keypoint_classifier_label.csv", encoding="utf-8-sig") as f:
             keypoint_classifier_labels = csv.reader(f)
             self.keypoint_classifier_labels = [row[0] for row in keypoint_classifier_labels]
 
@@ -214,7 +218,7 @@ class ASLApp(ctk.CTk):
         
         # Load Chart Image
         try:
-            chart_img = Image.open("assets/asl_chart.png")
+            chart_img = Image.open(BASE_DIR / "assets" / "asl_chart.png")
             chart_img.thumbnail((380, 380))
             self.chart_ctk_img = ctk.CTkImage(light_image=chart_img, dark_image=chart_img, size=chart_img.size)
             self.label_chart = ctk.CTkLabel(self.frame_chart, text="", image=self.chart_ctk_img)
