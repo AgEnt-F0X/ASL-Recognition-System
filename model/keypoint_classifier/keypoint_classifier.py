@@ -1,5 +1,13 @@
 import numpy as np
-import tensorflow as tf
+
+try:
+    from ai_edge_litert.interpreter import Interpreter
+except ImportError:
+    try:
+        from tensorflow.lite.python.interpreter import Interpreter
+    except (ImportError, AttributeError):
+        import tensorflow as tf
+        Interpreter = tf.lite.Interpreter
 
 
 class KeyPointClassifier(object):
@@ -8,7 +16,7 @@ class KeyPointClassifier(object):
         model_path="model/keypoint_classifier/keypoint_classifier.tflite",
         num_threads=1,
     ):
-        self.interpreter = tf.lite.Interpreter(
+        self.interpreter = Interpreter(
             model_path=model_path, num_threads=num_threads
         )
 
@@ -29,7 +37,11 @@ class KeyPointClassifier(object):
         output_details_tensor_index = self.output_details[0]["index"]
 
         result = self.interpreter.get_tensor(output_details_tensor_index)
-
-        result_index = np.argmax(np.squeeze(result))
+        probs = np.squeeze(result)
+        result_index = int(np.argmax(probs))
+        self.last_confidence = float(probs[result_index])
+        top_two = np.partition(probs, -2)[-2:]
+        self.last_margin = float(top_two[1] - top_two[0])
+        self.last_probabilities = probs.copy()
 
         return result_index
