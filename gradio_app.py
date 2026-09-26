@@ -16,6 +16,16 @@ import numpy as np
 from gesture_text import GestureTextComposer, TemporalPredictionFilter
 from model.keypoint_classifier.keypoint_classifier import KeyPointClassifier
 
+# Hugging Face ZeroGPU compatibility hook
+try:
+    import spaces
+
+    @spaces.GPU
+    def _hf_zerogpu_startup():
+        return True
+except Exception:
+    pass
+
 PROJECT_ROOT = Path(__file__).resolve().parent
 MODEL_PATH = PROJECT_ROOT / "model" / "keypoint_classifier" / "keypoint_classifier.tflite"
 LABEL_PATH = PROJECT_ROOT / "model" / "keypoint_classifier" / "keypoint_classifier_label.csv"
