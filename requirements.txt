@@ -1,10 +1,10 @@
-opencv-python
+opencv-python-headless
 mediapipe<=0.10.14
 ai-edge-litert
 customtkinter
 pyttsx3
 Pillow
-numpy
+numpy<2
 matplotlib
 scikit-learn
 protobuf>=4.25.3,<5
