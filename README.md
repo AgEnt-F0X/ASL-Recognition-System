@@ -1,3 +1,13 @@
+---
+title: ASL Sign to Text
+emoji: 🤟
+colorFrom: blue
+colorTo: indigo
+sdk: gradio
+app_file: gradio_app.py
+pinned: false
+---
+
 <div align="center">
 
 # 🤟 ASL Recognition System
