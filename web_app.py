@@ -33,6 +33,33 @@ HAND_CONNECTIONS = (
 )
 
 
+def get_ice_servers() -> list[dict[str, Any]]:
+    """Return STUN and TURN configuration with open relay fallback for cloud NAT traversal."""
+    if "ice_servers" in st.secrets:
+        return st.secrets["ice_servers"]
+    return [
+        {"urls": ["stun:stun.l.google.com:19302"]},
+        {"urls": ["stun:stun1.l.google.com:19302"]},
+        {"urls": ["stun:stun2.l.google.com:19302"]},
+        {"urls": ["stun:openrelay.metered.ca:80"]},
+        {
+            "urls": ["turn:openrelay.metered.ca:80"],
+            "username": "openrelayproject",
+            "credential": "openrelayproject",
+        },
+        {
+            "urls": ["turn:openrelay.metered.ca:443"],
+            "username": "openrelayproject",
+            "credential": "openrelayproject",
+        },
+        {
+            "urls": ["turn:openrelay.metered.ca:443?transport=tcp"],
+            "username": "openrelayproject",
+            "credential": "openrelayproject",
+        },
+    ]
+
+
 def landmark_list(image: np.ndarray, landmarks: Any) -> list[list[int]]:
     height, width = image.shape[:2]
     return [
@@ -60,7 +87,7 @@ def draw_hand(frame: np.ndarray, points: list[list[int]]) -> None:
 
 
 class RecognitionSession:
-    """Owns webcam inference state without calling Streamlit from WebRTC threads."""
+    """Owns inference state without calling Streamlit from WebRTC threads."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -82,44 +109,84 @@ class RecognitionSession:
         self._hint = "Show one clear hand sign"
 
     def process_frame(self, frame: av.VideoFrame) -> av.VideoFrame:
-        image = cv.flip(frame.to_ndarray(format="bgr24"), 1)
+        try:
+            image = frame.to_ndarray(format="bgr24")
+            image = cv.flip(image, 1)
+
+            # Cap frame width to 640px to conserve bandwidth and CPU
+            h, w = image.shape[:2]
+            if w > 640:
+                scale = 640.0 / w
+                image = cv.resize(image, (640, int(h * scale)))
+
+            image_rgb = cv.cvtColor(image, cv.COLOR_BGR2RGB)
+            image_rgb.flags.writeable = False
+            results = self._hands.process(image_rgb)
+            image_rgb.flags.writeable = True
+
+            predicted_character = None
+            probabilities = None
+            points: list[list[int]] | None = None
+            hand_detected = results.multi_hand_landmarks is not None
+            if hand_detected:
+                hand_landmarks = results.multi_hand_landmarks[0]
+                points = landmark_list(image, hand_landmarks)
+                class_index = self._classifier(preprocess_landmarks(points))
+                predicted_character = self._labels[class_index]
+                probabilities = self._classifier.last_probabilities
+
+            with self._lock:
+                smoothed = self._prediction_filter.update(probabilities)
+                stable_character = (
+                    self._labels[smoothed.label_index] if smoothed.is_stable else None
+                )
+                entry = self._composer.update(stable_character, hand_detected)
+                if entry.committed_character:
+                    self._sentence += entry.committed_character
+
+                self._current_character = stable_character or (
+                    f"{predicted_character}..." if predicted_character else "--"
+                )
+                self._confidence = smoothed.confidence if smoothed.is_stable else 0.0
+                self._progress = entry.progress
+                self._hint = entry.message
+                sentence = self._sentence
+
+            if points:
+                draw_hand(image, points)
+            self._draw_overlay(image, sentence)
+            return av.VideoFrame.from_ndarray(image, format="bgr24")
+        except Exception as exc:
+            # Prevent WebRTC crash on frame error
+            print(f"Frame processing error: {exc}")
+            return frame
+
+    def process_static_image(self, bgr_image: np.ndarray) -> tuple[np.ndarray, str | None, float]:
+        """Process a single image snapshot from browser camera or upload."""
+        image = bgr_image.copy()
+        h, w = image.shape[:2]
+        if w > 640:
+            scale = 640.0 / w
+            image = cv.resize(image, (640, int(h * scale)))
+
         image_rgb = cv.cvtColor(image, cv.COLOR_BGR2RGB)
         image_rgb.flags.writeable = False
         results = self._hands.process(image_rgb)
         image_rgb.flags.writeable = True
 
-        predicted_character = None
-        probabilities = None
-        points: list[list[int]] | None = None
-        hand_detected = results.multi_hand_landmarks is not None
-        if hand_detected:
+        if results.multi_hand_landmarks:
             hand_landmarks = results.multi_hand_landmarks[0]
             points = landmark_list(image, hand_landmarks)
             class_index = self._classifier(preprocess_landmarks(points))
-            predicted_character = self._labels[class_index]
-            probabilities = self._classifier.last_probabilities
-
-        with self._lock:
-            smoothed = self._prediction_filter.update(probabilities)
-            stable_character = (
-                self._labels[smoothed.label_index] if smoothed.is_stable else None
-            )
-            entry = self._composer.update(stable_character, hand_detected)
-            if entry.committed_character:
-                self._sentence += entry.committed_character
-
-            self._current_character = stable_character or (
-                f"{predicted_character}..." if predicted_character else "--"
-            )
-            self._confidence = smoothed.confidence if smoothed.is_stable else 0.0
-            self._progress = entry.progress
-            self._hint = entry.message
-            sentence = self._sentence
-
-        if points:
+            char = self._labels[class_index]
+            conf = self._classifier.last_confidence
             draw_hand(image, points)
-        self._draw_overlay(image, sentence)
-        return av.VideoFrame.from_ndarray(image, format="bgr24")
+            return image, char, conf
+        return image, None, 0.0
+
+    def add_character(self, char: str) -> None:
+        with self._lock:
+            self._sentence += char
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -187,9 +254,9 @@ st.set_page_config(page_title="ASL Sign to Text", page_icon="🤟", layout="wide
 st.markdown(
     """
     <style>
-      .block-container { max-width: 1280px; padding-top: 2rem; }
+      .block-container { max-width: 1280px; padding-top: 1.5rem; }
       [data-testid="stMetric"] { border-left: 3px solid #23a6d5; padding-left: 0.8rem; }
-      [data-testid="stImage"] img { border: 1px solid #d7dde5; }
+      [data-testid="stImage"] img { border: 1px solid #d7dde5; border-radius: 6px; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -199,19 +266,59 @@ if "recognition_session" not in st.session_state:
     st.session_state.recognition_session = RecognitionSession()
 session: RecognitionSession = st.session_state.recognition_session
 
-st.title("ASL Sign to Text")
+st.title("🤟 ASL Sign to Text")
 st.caption("Real-time fingerspelling recognition")
 
 camera_column, reference_column = st.columns((2, 1), gap="large")
+
 with camera_column:
-    webrtc_streamer(
-        key="asl-sign-camera",
-        mode=WebRtcMode.SENDRECV,
-        video_frame_callback=session.process_frame,
-        media_stream_constraints={"video": True, "audio": False},
-        rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
-        async_processing=True,
-    )
+    mode_tab_live, mode_tab_snapshot = st.tabs(["🎥 Live Stream", "📸 Snapshot Camera"])
+
+    with mode_tab_live:
+        webrtc_ctx = webrtc_streamer(
+            key="asl-sign-camera",
+            mode=WebRtcMode.SENDRECV,
+            video_frame_callback=session.process_frame,
+            media_stream_constraints={
+                "video": {
+                    "width": {"ideal": 640},
+                    "height": {"ideal": 480},
+                    "frameRate": {"ideal": 20, "max": 30},
+                },
+                "audio": False,
+            },
+            rtc_configuration={"iceServers": get_ice_servers()},
+            async_processing=True,
+        )
+        if webrtc_ctx and webrtc_ctx.state.playing:
+            st.success("🟢 Camera stream connected & active")
+        else:
+            st.info("Click **START** above to begin live video. If your network blocks live WebRTC, switch to the **Snapshot Camera** tab!")
+
+    with mode_tab_snapshot:
+        st.write("Take a snapshot of your hand gesture:")
+        camera_snap = st.camera_input("Capture gesture", label_visibility="collapsed")
+        if camera_snap is not None:
+            raw_bytes = np.asarray(bytearray(camera_snap.read()), dtype=np.uint8)
+            snap_img = cv.imdecode(raw_bytes, cv.IMREAD_COLOR)
+            processed_img, recognized_char, conf = session.process_static_image(snap_img)
+            
+            snap_col1, snap_col2 = st.columns(2)
+            with snap_col1:
+                st.image(
+                    cv.cvtColor(processed_img, cv.COLOR_BGR2RGB),
+                    caption="Analyzed Hand",
+                    use_column_width=True,
+                )
+            with snap_col2:
+                if recognized_char:
+                    st.metric("Detected Letter", recognized_char)
+                    st.metric("Confidence", f"{conf:.0%}")
+                    if st.button(f"Add '{recognized_char}' to Message", use_container_width=True):
+                        session.add_character(recognized_char)
+                        st.rerun()
+                else:
+                    st.warning("No hand detected. Please hold your hand clearly in front of the camera.")
 
 with reference_column:
     st.image(str(CHART_PATH), caption="ASL alphabet reference", use_column_width=True)
