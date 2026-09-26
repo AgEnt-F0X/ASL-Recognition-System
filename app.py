@@ -654,4 +654,8 @@ def draw_info(image, fps, mode, number):
 
 
 if __name__ == "__main__":
-    main()
+    if "SPACE_ID" in os.environ:
+        from gradio_app import demo
+        demo.launch()
+    else:
+        main()
